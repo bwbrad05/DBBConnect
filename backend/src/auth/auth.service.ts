@@ -12,6 +12,7 @@ import { MailService } from '../mail/mail.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { GoogleCompleteDto } from './dto/google-complete.dto';
 import { Prisma, UserRole } from '@prisma/client';
 
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1h
@@ -262,7 +263,7 @@ export class AuthService {
 
     const user = await this.prisma.user.findUnique({ where: { email } });
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    if (!user || !user.password || !(await bcrypt.compare(password, user.password))) {
       throw new UnauthorizedException('Invalid email or password');
     }
 
@@ -374,5 +375,178 @@ export class AuthService {
     });
 
     return { message: 'Logged out successfully' };
+  }
+
+  async googleCallback(googleUser: {
+    googleId: string;
+    email: string;
+    name: string;
+    picture?: string;
+  }) {
+    if (!googleUser.email) {
+      throw new BadRequestException('Google account has no verified email');
+    }
+
+    let user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ googleId: googleUser.googleId }, { email: googleUser.email }],
+      },
+    });
+
+    if (user) {
+      // Link Google ID and auto-verify email if not already done
+      if (!user.googleId || !user.emailVerifiedAt) {
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            googleId: user.googleId ?? googleUser.googleId,
+            emailVerifiedAt: user.emailVerifiedAt ?? new Date(),
+          },
+        });
+      }
+
+      const exchangeCode = this.jwtService.sign(
+        { sub: user.id, type: 'google_exchange' },
+        { expiresIn: '5m' },
+      );
+      return { type: 'existing' as const, code: exchangeCode };
+    }
+
+    // New user — store profile in a short-lived JWT; no DB record yet
+    const pendingCode = this.jwtService.sign(
+      {
+        googleId: googleUser.googleId,
+        email: googleUser.email,
+        name: googleUser.name,
+        picture: googleUser.picture,
+        type: 'google_pending',
+      },
+      { expiresIn: '10m' },
+    );
+    return { type: 'new' as const, code: pendingCode };
+  }
+
+  async googleExchange(code: string) {
+    let payload: { sub: string; type: string };
+    try {
+      payload = this.jwtService.verify(code) as { sub: string; type: string };
+    } catch {
+      throw new UnauthorizedException('Invalid or expired code');
+    }
+
+    if (payload.type !== 'google_exchange') {
+      throw new UnauthorizedException('Invalid code type');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user) throw new UnauthorizedException('User not found');
+
+    const { accessToken, refreshToken } = this.generateTokens(user);
+    await this.updateRefreshToken(user.id, refreshToken);
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role },
+    };
+  }
+
+  async googleComplete(dto: GoogleCompleteDto) {
+    const { code, role, phoneNumber, whatsappNumber } = dto;
+
+    let payload: {
+      googleId: string;
+      email: string;
+      name: string;
+      picture?: string;
+      type: string;
+    };
+    try {
+      payload = this.jwtService.verify(code) as typeof payload;
+    } catch {
+      throw new UnauthorizedException('Invalid or expired code');
+    }
+
+    if (payload.type !== 'google_pending') {
+      throw new UnauthorizedException('Invalid code type');
+    }
+
+    if (role === UserRole.ADMIN) {
+      throw new BadRequestException('Cannot register as ADMIN');
+    }
+
+    if (role === UserRole.TUTOR && !whatsappNumber) {
+      throw new BadRequestException('whatsappNumber is required for tutors');
+    }
+
+    const myReferralCode = randomBytes(4).toString('hex').toUpperCase();
+
+    try {
+      const { user, profileId } = await this.prisma.$transaction(async (tx) => {
+        const createdUser = await tx.user.create({
+          data: {
+            name: payload.name,
+            email: payload.email,
+            googleId: payload.googleId,
+            role,
+            phoneNumber,
+            referralCode: myReferralCode,
+            emailVerifiedAt: new Date(),
+          },
+        });
+
+        let pid: string;
+        if (role === UserRole.TUTOR) {
+          const tutorProfile = await tx.tutorProfile.create({
+            data: {
+              userId: createdUser.id,
+              bio: '',
+              subjects: [],
+              experience: 0,
+              hourlyRate: 0,
+              whatsappNumber: whatsappNumber!,
+            },
+          });
+          pid = tutorProfile.id;
+        } else {
+          const studentProfile = await tx.studentProfile.create({
+            data: {
+              userId: createdUser.id,
+              bio: '',
+              interests: [],
+            },
+          });
+          pid = studentProfile.id;
+        }
+
+        return { user: createdUser, profileId: pid };
+      });
+
+      const { accessToken, refreshToken } = this.generateTokens(user);
+      await this.updateRefreshToken(user.id, refreshToken);
+
+      return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          profileId,
+        },
+      };
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new ConflictException('Email or phone number already in use');
+      }
+      if (error instanceof BadRequestException) throw error;
+      throw new BadRequestException('Failed to complete registration');
+    }
   }
 }

@@ -1,17 +1,22 @@
 import {
   Controller,
+  Get,
   Post,
   Body,
   UseGuards,
   Request,
   HttpCode,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { GoogleCompleteDto } from './dto/google-complete.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import { GoogleAuthGuard } from './google.strategy';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import {
@@ -70,5 +75,34 @@ export class AuthController {
   @Post('resend-verification')
   resendVerification(@Body() dto: ResendVerificationDto) {
     return this.authService.resendVerification(dto.email);
+  }
+
+  @Get('google')
+  @UseGuards(GoogleAuthGuard)
+  googleLogin() {
+    // Passport redirects to Google; this body never executes
+  }
+
+  @Get('google/callback')
+  @UseGuards(GoogleAuthGuard)
+  async googleCallback(@Request() req: any, @Res() res: Response) {
+    const result = await this.authService.googleCallback(req.user);
+    const base = process.env.FRONTEND_URL ?? 'http://localhost:3000';
+    if (result.type === 'new') {
+      return res.redirect(`${base}/auth/register/google?code=${result.code}`);
+    }
+    return res.redirect(`${base}/auth/google/callback?code=${result.code}`);
+  }
+
+  @HttpCode(200)
+  @Post('google/exchange')
+  googleExchange(@Body('code') code: string) {
+    return this.authService.googleExchange(code);
+  }
+
+  @HttpCode(200)
+  @Post('google/complete')
+  googleComplete(@Body() dto: GoogleCompleteDto) {
+    return this.authService.googleComplete(dto);
   }
 }

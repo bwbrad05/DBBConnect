@@ -115,7 +115,8 @@ model User {
   id              String           @id @default(cuid())
   name            String
   email           String           @unique
-  password        String
+  password        String?
+  googleId        String?          @unique
   phoneNumber     String           @unique
   role            UserRole
   refreshToken    String?
